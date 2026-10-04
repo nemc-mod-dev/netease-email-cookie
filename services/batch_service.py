@@ -100,7 +100,8 @@ class _BatchRunnerBase:
     def _new_auth(self, account, run_dir, shared_device):
         label = account.get('label') or account.get('identifier') or 'account'
         account_dir = os.path.join(run_dir, 'accounts', _safe_label(label))
-        storage = StorageService(account_dir)
+        # artifact_dir='.'：每个账号目录本身就是产物根，避免出现 accounts/<x>/artifacts/ 的嵌套
+        storage = StorageService(account_dir, artifact_dir='.')
 
         sauth = account.get('sauth') or None
         if not sauth and account.get('sauth_file'):

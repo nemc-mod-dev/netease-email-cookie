@@ -31,6 +31,7 @@ tests/
   test_batch_cookie.py      批量转 Cookie 编排离线测试
   test_account_input.py     账号解析离线测试
   test_console.py           控制台入口离线测试
+  test_console_ui.py        排版层（宽度/对齐/颜色/表格）离线测试
 accounts.example.json       JSON 账号清单示例
 accounts.example.txt        纯文本账号清单示例
 requirements.txt            Python 依赖
@@ -97,6 +98,15 @@ cat accounts.txt | python main.py cookies --input -
 
 批量**审查**实名可以随意跑。批量**提交**只使用每个账号条目自带的真实身份，
 程序**不提供**"填一次身份刷所有账号"的全局选项；缺失身份的账号会被跳过。
+
+## 控制台外观
+
+界面自带统一排版：分区标题（`▍`）、分隔线、对齐表格、状态徽标与图例。
+颜色按语义固定：**绿＝成功、黄＝需处理、红＝失败、灰＝跳过**，启动时打印图例对照。
+
+- 颜色自动检测：输出到终端时开启；重定向到管道/文件时自动关闭。
+  - `NO_COLOR=1` 强制关闭，`FORCE_COLOR=1` 强制开启。
+- 制表符宽度按 1 计算；若你的终端把框线渲染成双宽导致错位，设 `CONSOLE_AMBIGUOUS_WIDE=1`。
 
 ## 运行测试
 

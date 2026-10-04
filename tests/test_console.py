@@ -48,6 +48,12 @@ def write_accounts(base, text='a@163.com----pw\nb@163.com----pw2\n'):
     return path
 
 
+class _StateMixin(unittest.TestCase):
+    def setUp(self):
+        console._LAST_ACCOUNTS['items'] = None
+        console._LAST_ACCOUNTS['source'] = ''
+
+
 class ParserTest(unittest.TestCase):
     def test_cookies_defaults(self):
         args = console.build_parser().parse_args(['cookies', '--input', 'x.txt'])
@@ -64,7 +70,7 @@ class ParserTest(unittest.TestCase):
         self.assertFalse(args.submit)
 
 
-class CookiesCommandTest(unittest.TestCase):
+class CookiesCommandTest(_StateMixin):
     def test_reads_file_and_runs(self):
         with tempfile.TemporaryDirectory() as base:
             path = write_accounts(base)
@@ -84,7 +90,7 @@ class CookiesCommandTest(unittest.TestCase):
             self.assertEqual(code, 2)
 
 
-class RealnameCommandTest(unittest.TestCase):
+class RealnameCommandTest(_StateMixin):
     def test_review_only(self):
         with tempfile.TemporaryDirectory() as base:
             path = write_accounts(base)
