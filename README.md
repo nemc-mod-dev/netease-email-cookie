@@ -50,14 +50,14 @@ python main.py
 # 或用子命令
 python main.py login --mode email --identifier you@163.com
 python main.py status
-python main.py realname-check
+python main.py realname-submit
 python main.py batch-realname --input accounts.json
 
 # 查看全部子命令
 python main.py --help
 ```
 
-子命令：`login` / `verify` / `send-sms` / `realname-check` / `realname-submit` /
+子命令：`login` / `verify` / `send-sms` / `realname-submit` /
 `mailbox` / `export` / `device` / `status` / `batch-realname`。不带子命令时进入交互菜单。
 密码、证件号等敏感字段建议留空，程序会用 `getpass` 交互读取，避免写入命令历史。
 
@@ -73,11 +73,17 @@ python main.py --help
 python -m unittest discover -s tests -v
 ```
 
-### 批量实名认证
+### 实名认证
 
-流程是 **先审查、后提交**，默认只审查、绝不会提交任何实名信息。
+单账号和批量都遵循 **先审查、后提交**：先查 `realname_status`，只在确实需要实名时才提交，已实名的账号直接跳过。
 
 ```bash
+# 单账号：先审查，需要时才要求填写身份信息
+python main.py realname-submit
+
+# 非交互式（已确认账号需要实名）
+python main.py realname-submit --realname 张三 --id-num 110101... --yes
+
 # 1) 仅审查：列出每个账号是否需要实名
 python batch_realname.py --input accounts.json
 

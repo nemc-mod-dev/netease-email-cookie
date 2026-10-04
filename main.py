@@ -7,7 +7,7 @@
     python main.py                 # 进入交互式菜单
     python main.py login --mode email --identifier you@163.com
     python main.py status
-    python main.py realname-check
+    python main.py realname-submit
     python main.py batch-realname --input accounts.json
 
 子命令一览见 ``python main.py --help``。
@@ -196,25 +196,33 @@ def cmd_send_sms(app, args):
     return 0 if result.get('status') == 'success' else 1
 
 
-def cmd_realname_check(app, args):
-    result = app.realname_check()
-    print_result(result, verbose=args.verbose)
-    state = result.get('realname_state')
-    echo(f"结论: {STATE_LABEL.get(state, state)}")
-    return 0 if result.get('status') == 'success' else 1
-
-
 def cmd_realname_submit(app, args):
+    """先审查实名状态，仅在需要时才收集身份信息并提交。"""
+    review = app.realname_check()
+    print_result(review, verbose=args.verbose)
+    if review.get('status') != 'success':
+        echo('无法确认实名状态，已中止提交。')
+        return 1
+
+    state = review.get('realname_state')
+    echo(f"审查结论: {STATE_LABEL.get(state, state)}")
+    if state == REALNAME_VERIFIED:
+        echo('该账号已完成实名，无需提交。')
+        return 0
+    if state != REALNAME_REQUIRED and not args.force:
+        echo('实名状态未知，未自动提交（确认无误可加 --force 强制提交）。')
+        return 1
+
     realname = args.realname
     id_num = args.id_num
     if not realname:
         if not is_interactive():
-            echo('缺少 --realname。')
+            echo('该账号需要实名，但缺少 --realname。')
             return 2
         realname = prompt('实名姓名', required=True)
     if not id_num:
         if not is_interactive():
-            echo('缺少 --id-num。')
+            echo('该账号需要实名，但缺少 --id-num。')
             return 2
         id_num = prompt_secret('证件号', required=True)
 
@@ -263,7 +271,6 @@ COMMANDS = {
     'login': cmd_login,
     'verify': cmd_verify,
     'send-sms': cmd_send_sms,
-    'realname-check': cmd_realname_check,
     'realname-submit': cmd_realname_submit,
     'mailbox': cmd_mailbox,
     'export': cmd_export,
@@ -306,13 +313,12 @@ def build_parser():
     sp = sub.add_parser('send-sms', parents=[common], help='为 ticket 发送安全验证短信')
     sp.add_argument('--ticket', required=True)
 
-    sub.add_parser('realname-check', parents=[common], help='审查当前会话账号是否需要实名')
-
-    sp = sub.add_parser('realname-submit', parents=[common], help='为当前会话账号提交实名')
+    sp = sub.add_parser('realname-submit', parents=[common], help='审查实名状态，需要时再提交（先审查后提交）')
     sp.add_argument('--realname')
     sp.add_argument('--id-num')
     sp.add_argument('--id-region', default='86')
     sp.add_argument('--yes', action='store_true', help='跳过二次确认')
+    sp.add_argument('--force', action='store_true', help='状态未知时也强制提交')
 
     sub.add_parser('mailbox', parents=[common], help='获取邮箱消息列表')
     sp = sub.add_parser('export', parents=[common], help='重新导出已恢复的会话产物')
@@ -333,13 +339,12 @@ MENU = [
     ('1', '邮箱转 Cookie'),
     ('2', '手机号转 Cookie'),
     ('3', '继续安全验证（ticket）'),
-    ('4', '审查实名状态'),
-    ('5', '提交实名'),
-    ('6', '获取邮件列表'),
-    ('7', '导出已恢复会话'),
-    ('8', '重建设备'),
-    ('9', '查看状态'),
-    ('10', '批量实名（说明）'),
+    ('4', '提交实名（先审查，按需提交）'),
+    ('5', '获取邮件列表'),
+    ('6', '导出已恢复会话'),
+    ('7', '重建设备'),
+    ('8', '查看状态'),
+    ('9', '批量实名（说明）'),
     ('0', '退出'),
 ]
 
@@ -373,28 +378,19 @@ def _interactive_dispatch(app, choice):
         ticket = prompt('ticket', default=app.pending_ticket, required=True)
         print_result(app.confirm_verification(ticket))
     elif choice == '4':
-        result = app.realname_check()
-        print_result(result)
-        echo(f"结论: {STATE_LABEL.get(result.get('realname_state'), result.get('realname_state'))}")
+        cmd_realname_submit(app, argparse.Namespace(
+            realname=None, id_num=None, id_region='86', yes=False, force=False, verbose=False))
     elif choice == '5':
-        echo('注意：必须使用本人真实合法的身份信息。')
-        realname = prompt('实名姓名', required=True)
-        id_num = prompt_secret('证件号', required=True)
-        if confirm(f"确认提交（{mask_realname(realname)} / {mask_id_num(id_num)}）？"):
-            print_result(app.realname_submit(realname, id_num))
-        else:
-            echo('已取消。')
-    elif choice == '6':
         print_result(app.mailbox())
-    elif choice == '7':
+    elif choice == '6':
         label = prompt('导出标签', default='restored_session')
         print_result(app.export_restored(label))
-    elif choice == '8':
+    elif choice == '7':
         if confirm('确认重建本机设备信息（会重新注册设备）？'):
             print_result(app.rebuild_device())
-    elif choice == '9':
+    elif choice == '8':
         echo(format_status(app.status()))
-    elif choice == '10':
+    elif choice == '9':
         echo('批量用法: python main.py batch-realname --input accounts.json [--submit]')
         echo('默认只审查；确认无误后再加 --submit。')
     else:

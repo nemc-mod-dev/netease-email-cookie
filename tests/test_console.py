@@ -16,7 +16,8 @@ from console_ui import format_status, summarize_result
 
 
 class FakeAuth:
-    def __init__(self):
+    def __init__(self, realname_state='required'):
+        self.realname_state = realname_state
         self.last_login_context = {}
         self.calls = []
         self._snapshot = {
@@ -26,8 +27,8 @@ class FakeAuth:
         }
 
     def check_realname_status(self):
-        return {'status': 'success', 'message': '实名状态查询成功', 'realname_state': 'required',
-                'needs_realname': True, 'realname_status': 0, 'need_aas': True}
+        return {'status': 'success', 'message': '实名状态查询成功', 'realname_state': self.realname_state,
+                'needs_realname': self.realname_state == 'required', 'realname_status': 0, 'need_aas': True}
 
     def submit_realname(self, realname, id_num, id_region='86'):
         self.calls.append(('submit', realname, id_num, id_region))
@@ -74,9 +75,9 @@ class FakeWorkflow:
         return {'status': 'success', 'message': '邮箱列表获取成功'}
 
 
-def make_app(login_result=None):
+def make_app(login_result=None, realname_state='required'):
     login_result = login_result or {'status': 'success', 'message': '登录成功', 'artifacts': {}}
-    return console.ConsoleApp(auth=FakeAuth(), workflow=FakeWorkflow(login_result))
+    return console.ConsoleApp(auth=FakeAuth(realname_state), workflow=FakeWorkflow(login_result))
 
 
 def run(capture_output, func, *args, **kwargs):
@@ -92,7 +93,7 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(args.timeout, 300)
 
     def test_short_verbose_flag(self):
-        args = console.build_parser().parse_args(['realname-check', '-v'])
+        args = console.build_parser().parse_args(['status', '-v'])
         self.assertTrue(args.verbose)
 
     def test_batch_realname_intercepted_without_args(self):
@@ -129,27 +130,46 @@ class LoginCommandTest(unittest.TestCase):
 
 
 class RealnameCommandTest(unittest.TestCase):
-    def test_realname_check_reports_state(self):
-        app = make_app()
-        args = console.build_parser().parse_args(['realname-check'])
-        out = io.StringIO()
-        code = run(out, console.cmd_realname_check, app, args)
-        self.assertEqual(code, 0)
-        self.assertIn('需要实名', out.getvalue())
-
-    def test_realname_submit_with_yes(self):
+    def test_submit_reviews_then_submits_when_required(self):
         app = make_app()
         args = console.build_parser().parse_args(
-            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes']
-        )
-        code = run(io.StringIO(), console.cmd_realname_submit, app, args)
+            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes'])
+        out = io.StringIO()
+        code = run(out, console.cmd_realname_submit, app, args)
         self.assertEqual(code, 0)
+        self.assertIn('审查结论: 需要实名', out.getvalue())
         self.assertEqual(app.auth.calls, [('submit', '张三', '110101199001011237', '86')])
 
-    def test_realname_submit_bad_identity_requires_confirmation(self):
+    def test_submit_skips_when_already_verified(self):
+        app = make_app(realname_state='verified')
+        args = console.build_parser().parse_args(['realname-submit', '--yes'])
+        out = io.StringIO()
+        code = run(out, console.cmd_realname_submit, app, args)
+        self.assertEqual(code, 0)
+        self.assertIn('无需提交', out.getvalue())
+        self.assertEqual(app.auth.calls, [])
+
+    def test_submit_blocks_on_unknown_without_force(self):
+        app = make_app(realname_state='unknown')
+        args = console.build_parser().parse_args(
+            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes'])
+        out = io.StringIO()
+        code = run(out, console.cmd_realname_submit, app, args)
+        self.assertEqual(code, 1)
+        self.assertIn('状态未知', out.getvalue())
+        self.assertEqual(app.auth.calls, [])
+
+    def test_submit_force_overrides_unknown(self):
+        app = make_app(realname_state='unknown')
+        args = console.build_parser().parse_args(
+            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes', '--force'])
+        code = run(io.StringIO(), console.cmd_realname_submit, app, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(app.auth.calls), 1)
+
+    def test_submit_requires_identity_after_review(self):
         app = make_app()
         args = console.build_parser().parse_args(['realname-submit', '--id-num', 'x', '--yes'])
-        # 非交互且缺少 realname -> 返回 2，不应调用提交
         code = run(io.StringIO(), console.cmd_realname_submit, app, args)
         self.assertEqual(code, 2)
         self.assertEqual(app.auth.calls, [])
