@@ -9,6 +9,7 @@
 - 1351 安全验证处理（短信验证、状态轮询，不可靠时回退人工验证）
 - Cookie / SAuth 自动拼接、保存与导出（NEMC 格式）
 - 邮箱消息列表获取
+- **批量实名认证**：先审查账号是否需要实名，再按需提交，输出脱敏报告
 
 ## 项目结构
 
@@ -17,12 +18,17 @@ main.py                     程序入口，启动 Textual 界面
 app.py                      Textual TUI（邮箱/手机号两种模式）
 workflow.py                 AuthWorkflow，编排登录/验证流程与轮询
 view_state.py               UI 状态与展示文本
+batch_realname.py           批量实名认证命令行入口
 services/
   auth_service.py           NetEaseAuthService：设备、登录、SAuth、邮件列表
   verify_service.py         VerifyService：1351 安全验证相关接口
+  realname_service.py       RealnameService：实名审查与提交接口
+  batch_service.py          BatchRealnameRunner：批量编排与报告
   storage_service.py        StorageService：产物读写与导出
 tests/
-  test_smoke.py             离线冒烟测试（桩响应，不联网）
+  test_smoke.py             登录/存储层离线冒烟测试
+  test_realname.py          实名接口与批量编排离线测试
+accounts.example.json       批量账号文件示例
 requirements.txt            Python 依赖
 artifacts/                  运行产物统一输出目录
 ```
@@ -53,11 +59,33 @@ python main.py
 python -m unittest discover -s tests -v
 ```
 
+### 批量实名认证
+
+流程是 **先审查、后提交**，默认只审查、绝不会提交任何实名信息。
+
+```bash
+# 1) 仅审查：列出每个账号是否需要实名
+python batch_realname.py --input accounts.json
+
+# 2) 确认报告无误后，再对「需要实名」的账号提交
+python batch_realname.py --input accounts.json --submit --delay 2
+```
+
+账号文件格式见 `accounts.example.json`，支持两种会话来源：
+
+- `sauth` / `sauth_file`：直接复用已有会话（如 `artifacts/nemc_cookie_*.json`），跳过登录；
+- `identifier` + `password`（邮箱）或 + `sms_code`（手机号）：现场登录换取会话。
+
+审查依据的是抓包确认的接口：`GET .../users/{uid}/info?opt_fields=realname_status`；
+提交走 `POST .../realname/verify` + `POST .../realname/update_by_token`。
+报告写入 `artifacts/batch/<run_id>/report.json` 与 `report.csv`，其中姓名/证件号**已脱敏**。
+
 ## 注意事项
 
 - 如遇安全验证，可能需要手动完成验证流程。
 - 一个手机号一天内通常只能完成有限次数的安全验证。
 - `artifacts/`、`device_info.json`、`sauth_data.json`、`nemc_cookie_*.json` 含会话凭据，已被 `.gitignore` 忽略，请勿随代码分发或提交。
+- **实名认证必须使用本人真实、合法的身份信息**；批量工具仅用于管理你自己的账号，请勿用于他人身份或违规批量注册/交易账号。账号资料文件（`accounts.json`）、抓包文件（`*.har`）含敏感信息，已加入 `.gitignore`。
 
 ## 技术实现
 

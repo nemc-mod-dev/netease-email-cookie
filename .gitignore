@@ -6,3 +6,9 @@ cookies.json
 device_info.json
 sauth_data.json
 nemc_cookie_*.json
+
+# 账号资料与抓包（含个人身份/凭据信息），不要提交
+accounts.json
+accounts.local.json
+secrets/
+*.har

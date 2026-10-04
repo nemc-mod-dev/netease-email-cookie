@@ -15,6 +15,7 @@ import requests
 
 from services.storage_service import StorageService
 from services.verify_service import VerifyService, _normalize_login_1351
+from services.realname_service import RealnameService
 
 
 class NetEaseAuthService:
@@ -30,6 +31,7 @@ class NetEaseAuthService:
         self.last_verify_context = {}
         self.last_artifacts = {}
         self.last_mailbox = None
+        self.last_realname = {}
         self.last_error = None
 
         saved_device = self.storage.load_device_info()
@@ -65,6 +67,12 @@ class NetEaseAuthService:
             self.session,
             device_payload_getter=self._verification_payload,
             headers_getter=self._verification_headers,
+        )
+        self.realname_service = RealnameService(
+            self.session,
+            app_payload_getter=self._app_payload,
+            headers_getter=self._get_headers,
+            device_info_getter=lambda: self.device_info,
         )
 
     def _result(self, status, message='', **kwargs):
@@ -380,6 +388,42 @@ class NetEaseAuthService:
 
     def send_verify_sms(self, ticket):
         return self.verify_service.send_sms_code(ticket)
+
+    def inject_session(self, sauth_data, cookies=None):
+        """注入已有会话（如从 nemc_cookie 产物恢复），供审查/实名复用。"""
+        if not isinstance(sauth_data, dict) or not sauth_data:
+            return self._result('failed', '缺少可用的会话数据')
+        self.sauth_data = dict(sauth_data)
+        label = sauth_data.get('_label')
+        if label:
+            self.current_conversion_label = label
+        self.current_conversion_complete = bool(sauth_data.get('sessionid') and sauth_data.get('sdkuid'))
+        self.restored_session_exported = True
+        if cookies:
+            self.session.cookies.update(cookies)
+        return self._result(
+            'success', '会话已注入',
+            has_sdkuid=bool(sauth_data.get('sdkuid')), has_sessionid=bool(sauth_data.get('sessionid')),
+        )
+
+    def check_realname_status(self):
+        """审查当前会话账号是否需要实名。"""
+        self._refresh_transactions()
+        result = self.realname_service.query_status(
+            self.sauth_data.get('sdkuid'), self.sauth_data.get('sessionid'),
+        )
+        self.last_realname = result
+        return result
+
+    def submit_realname(self, realname, id_num, id_region='86', sync=True):
+        """为当前会话账号提交实名。"""
+        self._refresh_transactions()
+        result = self.realname_service.submit(
+            self.sauth_data.get('sdkuid'), self.sauth_data.get('sessionid'),
+            realname, id_num, id_region=id_region, sync=sync,
+        )
+        self.last_realname = result
+        return result
 
     def check_verification_status(self, ticket):
         return self.verify_service.check_verification_status(ticket)

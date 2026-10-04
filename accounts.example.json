@@ -1,0 +1,18 @@
+[
+  {
+    "label": "示例-复用已有会话",
+    "identifier": "aa41153216567@163.com",
+    "sauth_file": "artifacts/nemc_cookie_Ig410027915_20260827_224007.json",
+    "realname": "张三",
+    "id_num": "110101199001011237",
+    "id_region": "86"
+  },
+  {
+    "label": "示例-邮箱密码登录",
+    "identifier": "user@163.com",
+    "password": "your-password",
+    "mode": "email",
+    "realname": "李四",
+    "id_num": "110101199001011237"
+  }
+]
