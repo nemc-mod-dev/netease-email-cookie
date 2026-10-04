@@ -52,8 +52,8 @@ from services.realname_service import (
 BATCH_OUTPUT_ROOT = 'artifacts/batch'
 PREVIEW_LIMIT = 15
 
-# 进程内记住上次用的清单与来源，省得每轮重贴。
-_LAST_ACCOUNTS = {'items': None, 'source': ''}
+# 交互模式下的常驻配置：清单 + 间隔。选中任务即按此执行，不再逐次问答。
+_CONFIG = {'accounts': None, 'source': '', 'delay': 2.0}
 
 # 阶段/状态 → (中文文案, 颜色语义)
 COOKIE_STAGES = {
@@ -117,6 +117,7 @@ def _prompt_accounts():
 
 
 def _resolve_accounts(args):
+    """子命令用：只认显式 --input，不回退到任何残留状态。"""
     path = getattr(args, 'input', None)
     if path:
         try:
@@ -126,17 +127,6 @@ def _resolve_accounts(args):
         except (ValueError, OSError) as e:
             echo(style(f'读取失败: {e}', 'bright_red'))
         return None
-    if _LAST_ACCOUNTS['items']:
-        reuse = confirm(f"沿用上次清单（{_LAST_ACCOUNTS['source']}，"
-                        f"{len(_LAST_ACCOUNTS['items'])} 个账号）？", default=True)
-        if reuse:
-            return list(_LAST_ACCOUNTS['items']), _LAST_ACCOUNTS['source']
-    if is_interactive():
-        resolved = _prompt_accounts()
-        if resolved:
-            _LAST_ACCOUNTS['items'] = list(resolved[0])
-            _LAST_ACCOUNTS['source'] = resolved[1]
-        return resolved
     echo(style('缺少 --input（文件路径，或 - 表示从标准输入读取）。', 'bright_red'))
     return None
 
@@ -274,26 +264,24 @@ def _print_summary(report):
         echo('  ' + style('      ', 'dim') + str(report.get('report_csv')))
 
 
+def _cancel():
+    blank()
+    echo('  ' + badge('已取消，未执行。', 'warn'))
+    return 1
+
+
 # --------------------------------------------------------------------------
-# 子命令
+# 执行体（子命令与交互菜单共用）
 # --------------------------------------------------------------------------
 
-def cmd_cookies(args, runner=None):
-    resolved = _resolve_accounts(args)
-    if not resolved:
-        return 2
-    accounts, source = resolved
+def _execute_cookies(accounts, source, delay, runner=None, assume_yes=False):
     _print_accounts(accounts, source)
-    delay = _ask_delay(args, len(accounts))
-
-    if is_interactive():
+    if not assume_yes:
         blank()
-        if not confirm(f'对 {len(accounts)} 个账号执行「转 Cookie」？'):
-            blank()
-            echo('  ' + badge('已取消，未执行。', 'warn'))
-            return 1
+        if not confirm(f'对 {len(accounts)} 个账号执行「转 Cookie」（间隔 {delay:g}s）？'):
+            return _cancel()
 
-    runner = runner or BatchCookieRunner(output_root=getattr(args, 'output', None) or BATCH_OUTPUT_ROOT)
+    runner = runner or BatchCookieRunner(output_root=BATCH_OUTPUT_ROOT)
     blank()
     section('执行中')
     report = runner.run(accounts, delay=delay, on_progress=_cookie_progress)
@@ -301,42 +289,44 @@ def cmd_cookies(args, runner=None):
     return 0
 
 
-def cmd_realname(args, runner=None):
-    resolved = _resolve_accounts(args)
-    if not resolved:
-        return 2
-    accounts, source = resolved
+def _execute_realname(accounts, source, delay, submit, runner=None, assume_yes=False):
     _print_accounts(accounts, source)
-
-    submit = getattr(args, 'submit', None)
-    if submit is None:
-        blank()
-        menu([('1', '只审查', '查看每个账号是否需要实名'),
-              ('2', '审查后提交', '需要实名且有身份时才提交')], title='模式')
-        blank()
-        submit = prompt('请选择', default='1').startswith('2')
-    delay = _ask_delay(args, len(accounts))
-
     if submit:
         blank()
         echo('  ' + badge('批量提交只使用各账号条目自带的真实身份；缺身份的账号会跳过。', 'warn'))
-        if is_interactive() and not confirm('确认对「需要实名」的账号提交实名？', default=False):
-            blank()
-            echo('  ' + badge('已取消，未执行。', 'warn'))
-            return 1
-    elif is_interactive():
+        if not assume_yes and not confirm('确认对「需要实名」的账号提交实名？', default=False):
+            return _cancel()
+    elif not assume_yes:
         blank()
-        if not confirm(f'对 {len(accounts)} 个账号执行「实名审查」？'):
-            blank()
-            echo('  ' + badge('已取消，未执行。', 'warn'))
-            return 1
+        if not confirm(f'对 {len(accounts)} 个账号执行「实名审查」（间隔 {delay:g}s）？'):
+            return _cancel()
 
-    runner = runner or BatchRealnameRunner(output_root=getattr(args, 'output', None) or BATCH_OUTPUT_ROOT)
+    runner = runner or BatchRealnameRunner(output_root=BATCH_OUTPUT_ROOT)
     blank()
     section('执行中')
     report = runner.run(accounts, submit=bool(submit), delay=delay, on_progress=_realname_progress)
     _print_summary(report)
     return 0
+
+
+def cmd_cookies(args, runner=None):
+    resolved = _resolve_accounts(args)
+    if not resolved:
+        return 2
+    accounts, source = resolved
+    delay = _ask_delay(args, len(accounts))
+    return _execute_cookies(accounts, source, delay, runner, assume_yes=not is_interactive())
+
+
+def cmd_realname(args, runner=None):
+    resolved = _resolve_accounts(args)
+    if not resolved:
+        return 2
+    accounts, source = resolved
+    delay = _ask_delay(args, len(accounts))
+    submit = bool(getattr(args, 'submit', False))
+    return _execute_realname(accounts, source, delay, submit, runner,
+                             assume_yes=not is_interactive())
 
 
 def _results_rows(report):
@@ -430,15 +420,62 @@ def build_parser():
 
 
 # --------------------------------------------------------------------------
-# 交互式菜单
+# 交互式菜单（方向 A：顶部常驻配置，选中即跑）
 # --------------------------------------------------------------------------
 
-MENU = [
-    ('1', '批量转 Cookie', '登录并生成可复用 Cookie'),
-    ('2', '批量实名', '先审查，按需提交'),
-    ('3', '查看上次结果', '显示最近一次运行的报告'),
-    ('0', '退出', ''),
-]
+def _config_line():
+    if _CONFIG['accounts']:
+        return f"{_CONFIG['source']}（{len(_CONFIG['accounts'])} 个账号）"
+    return '未设置'
+
+
+def _show_config():
+    section('当前配置')
+    fields([('清单', _config_line()),
+            ('间隔', f"{_CONFIG['delay']:g}s")])
+
+
+def _menu_items():
+    return [
+        ('1', '换清单', '选择账号来源'),
+        ('2', '改间隔', f"当前 {_CONFIG['delay']:g}s"),
+        ('3', '转 Cookie', '登录并生成可复用 Cookie'),
+        ('4', '实名审查', '只查看每个账号是否需要实名'),
+        ('5', '实名提交', '先审查，需要实名且有身份时才提交'),
+        ('6', '查看上次结果', '显示最近一次运行的报告'),
+        ('0', '退出', ''),
+    ]
+
+
+def _set_list():
+    resolved = _prompt_accounts()
+    if not resolved:
+        return False
+    _CONFIG['accounts'] = list(resolved[0])
+    _CONFIG['source'] = resolved[1]
+    blank()
+    echo('  ' + badge(f"已设置清单：{resolved[1]}（{len(resolved[0])} 个账号）", 'success'))
+    return True
+
+
+def _set_delay():
+    raw = prompt('请求间隔(秒)', default=f"{_CONFIG['delay']:g}")
+    try:
+        _CONFIG['delay'] = max(0.0, float(raw))
+    except (TypeError, ValueError):
+        blank()
+        echo('  ' + badge('无效数字，保持原值。', 'warn'))
+        return
+    blank()
+    echo('  ' + badge(f"间隔已设为 {_CONFIG['delay']:g}s", 'success'))
+
+
+def _require_list():
+    if _CONFIG['accounts']:
+        return True
+    blank()
+    echo('  ' + badge('还没设置清单，请先选择账号来源。', 'warn'))
+    return _set_list()
 
 
 def run_interactive(_app=None):
@@ -454,18 +491,32 @@ def run_interactive(_app=None):
 
     while True:
         blank()
-        menu(MENU, title='主菜单')
+        _show_config()
+        blank()
+        menu(_menu_items(), title='主菜单')
         blank()
         choice = prompt('请选择')
+
         if choice in ('0', 'q', 'quit', 'exit'):
             blank()
             echo('  再见。')
             return 0
         if choice == '1':
-            cmd_cookies(argparse.Namespace(input=None, delay=None, output=BATCH_OUTPUT_ROOT))
+            _set_list()
         elif choice == '2':
-            cmd_realname(argparse.Namespace(input=None, submit=None, delay=None, output=BATCH_OUTPUT_ROOT))
+            _set_delay()
         elif choice == '3':
+            if _require_list():
+                _execute_cookies(_CONFIG['accounts'], _CONFIG['source'], _CONFIG['delay'])
+        elif choice == '4':
+            if _require_list():
+                _execute_realname(_CONFIG['accounts'], _CONFIG['source'], _CONFIG['delay'],
+                                  submit=False)
+        elif choice == '5':
+            if _require_list():
+                _execute_realname(_CONFIG['accounts'], _CONFIG['source'], _CONFIG['delay'],
+                                  submit=True)
+        elif choice == '6':
             cmd_result(argparse.Namespace(run_id=None, output=BATCH_OUTPUT_ROOT))
         else:
             blank()

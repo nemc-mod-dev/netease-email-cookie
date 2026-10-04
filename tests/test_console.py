@@ -50,8 +50,9 @@ def write_accounts(base, text='a@163.com----pw\nb@163.com----pw2\n'):
 
 class _StateMixin(unittest.TestCase):
     def setUp(self):
-        console._LAST_ACCOUNTS['items'] = None
-        console._LAST_ACCOUNTS['source'] = ''
+        console._CONFIG['accounts'] = None
+        console._CONFIG['source'] = ''
+        console._CONFIG['delay'] = 2.0
 
 
 class ParserTest(unittest.TestCase):
@@ -143,6 +144,77 @@ class InteractiveGuardTest(unittest.TestCase):
             code = run(out, console.run_interactive)
             self.assertEqual(code, 2)
             self.assertIn('非交互环境', out.getvalue())
+
+
+class ConfigTest(_StateMixin):
+    def test_set_delay_parses_number(self):
+        with mock.patch.object(console, 'prompt', return_value='5'):
+            run(io.StringIO(), console._set_delay)
+        self.assertEqual(console._CONFIG['delay'], 5.0)
+
+    def test_set_delay_keeps_value_on_garbage(self):
+        console._CONFIG['delay'] = 3.0
+        with mock.patch.object(console, 'prompt', return_value='abc'):
+            run(io.StringIO(), console._set_delay)
+        self.assertEqual(console._CONFIG['delay'], 3.0)
+
+    def test_set_list_stores_accounts(self):
+        accounts = [{'identifier': 'a@163.com', 'password': 'p'}]
+        with mock.patch.object(console, '_prompt_accounts', return_value=(accounts, 'src')):
+            self.assertTrue(run(io.StringIO(), console._set_list))
+        self.assertEqual(console._CONFIG['accounts'], accounts)
+        self.assertEqual(console._CONFIG['source'], 'src')
+
+    def test_require_list_prompts_when_empty(self):
+        with mock.patch.object(console, '_prompt_accounts', return_value=([{'identifier': 'a'}], 'src')):
+            self.assertTrue(run(io.StringIO(), console._require_list))
+        self.assertEqual(console._CONFIG['source'], 'src')
+
+    def test_require_list_false_when_cancelled(self):
+        with mock.patch.object(console, '_prompt_accounts', return_value=None):
+            self.assertFalse(run(io.StringIO(), console._require_list))
+
+
+class InteractiveLoopTest(_StateMixin):
+    def test_set_list_then_run_cookies(self):
+        runner = FakeRunner()
+        accounts = [{'identifier': 'a@163.com', 'password': 'p'}]
+        with mock.patch.object(console, 'is_interactive', return_value=True), \
+                mock.patch.object(console, 'prompt', side_effect=['1', '3', '0']), \
+                mock.patch.object(console, '_prompt_accounts', return_value=(accounts, 'src')), \
+                mock.patch.object(console, 'confirm', return_value=True), \
+                mock.patch.object(console, 'BatchCookieRunner', return_value=runner):
+            code = run(io.StringIO(), console.run_interactive)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(runner.calls[0]['accounts'], accounts)
+
+    def test_task_without_list_asks_for_list(self):
+        runner = FakeRunner()
+        accounts = [{'identifier': 'a@163.com', 'password': 'p'}]
+        with mock.patch.object(console, 'is_interactive', return_value=True), \
+                mock.patch.object(console, 'prompt', side_effect=['3', '0']), \
+                mock.patch.object(console, '_prompt_accounts', return_value=(accounts, 'src')), \
+                mock.patch.object(console, 'confirm', return_value=True), \
+                mock.patch.object(console, 'BatchCookieRunner', return_value=runner):
+            code = run(io.StringIO(), console.run_interactive)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_realname_submit_uses_config(self):
+        runner = FakeRunner('realname', summary={'total': 1, 'verified': 0, 'required': 1,
+                                                 'unknown': 0, 'submitted': 1, 'submit_failed': 0,
+                                                 'skipped': 0, 'needs_manual_verify': 0, 'failed': 0})
+        accounts = [{'identifier': 'a@163.com', 'password': 'p', 'realname': '张三',
+                     'id_num': '110101199001011237'}]
+        with mock.patch.object(console, 'is_interactive', return_value=True), \
+                mock.patch.object(console, 'prompt', side_effect=['1', '5', '0']), \
+                mock.patch.object(console, '_prompt_accounts', return_value=(accounts, 'src')), \
+                mock.patch.object(console, 'confirm', return_value=True), \
+                mock.patch.object(console, 'BatchRealnameRunner', return_value=runner):
+            code = run(io.StringIO(), console.run_interactive)
+        self.assertEqual(code, 0)
+        self.assertTrue(runner.calls[0]['submit'])
 
 
 if __name__ == '__main__':
