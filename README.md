@@ -14,11 +14,10 @@
 ## 项目结构
 
 ```
-main.py                     程序入口，启动 Textual 界面
-app.py                      Textual TUI（邮箱/手机号两种模式）
-workflow.py                 AuthWorkflow，编排登录/验证流程与轮询
-view_state.py               UI 状态与展示文本
-batch_realname.py           批量实名认证命令行入口
+main.py                     纯控制台入口（子命令 + 交互菜单）
+console_ui.py               控制台输出格式化与输入辅助
+workflow.py                 AuthWorkflow，编排登录/验证流程
+batch_realname.py           批量实名认证命令行（也可用 main.py batch-realname）
 services/
   auth_service.py           NetEaseAuthService：设备、登录、SAuth、邮件列表
   verify_service.py         VerifyService：1351 安全验证相关接口
@@ -28,6 +27,7 @@ services/
 tests/
   test_smoke.py             登录/存储层离线冒烟测试
   test_realname.py          实名接口与批量编排离线测试
+  test_console.py           控制台入口离线测试
 accounts.example.json       批量账号文件示例
 requirements.txt            Python 依赖
 artifacts/                  运行产物统一输出目录
@@ -44,13 +44,27 @@ pip install -r requirements.txt
 ### 运行程序
 
 ```bash
+# 交互式菜单（直接运行即可）
 python main.py
+
+# 或用子命令
+python main.py login --mode email --identifier you@163.com
+python main.py status
+python main.py realname-check
+python main.py batch-realname --input accounts.json
+
+# 查看全部子命令
+python main.py --help
 ```
+
+子命令：`login` / `verify` / `send-sms` / `realname-check` / `realname-submit` /
+`mailbox` / `export` / `device` / `status` / `batch-realname`。不带子命令时进入交互菜单。
+密码、证件号等敏感字段建议留空，程序会用 `getpass` 交互读取，避免写入命令历史。
 
 ### 操作流程
 
-- **邮箱模式**：输入邮箱和密码后点击「开始转换」；如触发安全验证，按提示完成验证。
-- **手机号模式**：输入手机号请求短信，收到后填写验证码并提交。
+- **邮箱模式**：`python main.py login --mode email --identifier you@163.com`；如触发安全验证，按提示打开验证链接，完成后用 `python main.py verify --ticket <ticket>` 确认，或登录时加 `--wait` 自动轮询。
+- **手机号模式**：`python main.py login --mode phone --identifier 138...`，请求短信后填写验证码提交。
 - 转换成功后，产物（SAuth、HTTP Cookies、Cookie 格式、NEMC Cookie）统一写入 `artifacts/` 目录，其中 `nemc_cookie_*.json` 为可复用结果。
 
 ### 运行测试
@@ -90,7 +104,7 @@ python batch_realname.py --input accounts.json --submit --delay 2
 ## 技术实现
 
 - 基于 Python `requests` 实现 HTTP 请求
-- 使用 `textual` 构建终端界面
+- 纯标准库控制台（`argparse` + 交互菜单），无 TUI 依赖
 - 模拟移动端设备信息和请求头，`pycryptodome` 处理登录参数加密
 
 ## 免责声明
