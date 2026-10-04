@@ -12,3 +12,6 @@ accounts.json
 accounts.local.json
 secrets/
 *.har
+
+# 账号清单（纯文本）
+accounts.txt

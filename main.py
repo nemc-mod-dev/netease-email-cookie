@@ -1,44 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""网易邮箱 / Cookie 工具 —— 纯控制台入口。
+"""网易账号批量工具 —— 纯控制台入口。
+
+定位：喂进一批账号，批量转 Cookie，或批量做实名审查/提交。
+没有"主账号"、没有跨运行的会话；每个账号在自己的处理步骤里独立登录。
 
 用法::
 
-    python main.py                 # 进入交互式菜单
-    python main.py login --mode email --identifier you@163.com
-    python main.py status
-    python main.py realname-submit
-    python main.py batch-realname --input accounts.json
+    python main.py                    # 交互式菜单
+    python main.py cookies   --input accounts.txt
+    python main.py realname  --input accounts.txt [--submit]
+    python main.py result
 
-子命令一览见 ``python main.py --help``。
+账号来源（``--input``，或交互时选择）：
+
+- 文件路径；``-`` 表示从标准输入读取
+- 文本格式：``邮箱----密码``，实名可写 ``邮箱----密码----姓名----证件号``
+- JSON：数组或 ``{"accounts": [...]}``
 """
 
 import argparse
-import shutil
-import subprocess
+import json
+import os
 import sys
-import time
 
-import batch_realname
-from console_ui import (
-    confirm,
-    echo,
-    format_status,
-    is_interactive,
-    print_result,
-    prompt,
-    prompt_secret,
-)
-from services.auth_service import NetEaseAuthService
+from console_ui import confirm, echo, is_interactive, prompt, read_multiline
+from services.account_input import load_accounts, parse_accounts_text
+from services.batch_service import BatchCookieRunner, BatchRealnameRunner
 from services.realname_service import (
     REALNAME_REQUIRED,
     REALNAME_UNKNOWN,
     REALNAME_VERIFIED,
-    mask_id_num,
-    mask_realname,
 )
-from services.verify_service import VERIFY_MANUAL_ONLY, VERIFY_RESOLVED
-from workflow import AuthWorkflow
+
+BATCH_OUTPUT_ROOT = 'artifacts/batch'
 
 STATE_LABEL = {
     REALNAME_VERIFIED: '已实名',
@@ -47,237 +42,187 @@ STATE_LABEL = {
 }
 
 
-class ConsoleApp:
-    """把服务层能力封装成控制台动作，便于子命令与交互菜单复用。"""
+# --------------------------------------------------------------------------
+# 账号来源
+# --------------------------------------------------------------------------
 
-    def __init__(self, auth=None, workflow=None):
-        self.auth = auth or NetEaseAuthService()
-        self.workflow = workflow or AuthWorkflow(self.auth)
-        self.pending_ticket = ''
-        self.pending_phone = ''
-        self.pending_verify_url = ''
-
-    # ---- 会话 / 转换 ----
-    def email_login(self, identifier, password):
-        return self._remember(self.workflow.run_email_login(identifier, password))
-
-    def request_phone_sms(self, identifier):
-        self.pending_phone = identifier
-        return self.workflow.request_phone_sms(identifier)
-
-    def phone_login(self, identifier, sms_code):
-        return self._remember(self.workflow.complete_phone_login(identifier, sms_code))
-
-    def confirm_verification(self, ticket, label=None):
-        label = label or self.pending_phone or self.auth.last_login_context.get('identifier') or 'verified_account'
-        return self._remember(self.workflow.confirm_verification(ticket, label))
-
-    def poll_verify(self, ticket, label=None, timeout=300, interval=5):
-        """同步轮询验证状态，直到完成 / 需人工 / 超时。"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            status = self.auth.check_verification_status(ticket)
-            data = status.get('data') or {}
-            if status.get('verify_state') == VERIFY_RESOLVED or (isinstance(data, dict) and data.get('user')):
-                return self.confirm_verification(ticket, label)
-            if status.get('status') in ('manual_required', 'error') or status.get('verify_state') == VERIFY_MANUAL_ONLY:
-                return status
-            time.sleep(interval)
-        return {'status': 'timeout', 'message': f'等待安全验证超时（{timeout}s）'}
-
-    # ---- 实名 ----
-    def realname_check(self):
-        return self.auth.check_realname_status()
-
-    def realname_submit(self, realname, id_num, id_region='86'):
-        return self.auth.submit_realname(realname, id_num, id_region=id_region)
-
-    # ---- 其他 ----
-    def mailbox(self):
-        return self.workflow.fetch_mailbox()
-
-    def export_restored(self, label='restored_session'):
-        return self.auth.export_restored_session(label)
-
-    def rebuild_device(self):
-        return self.auth.rebuild_device()
-
-    def status(self):
-        return self.auth.get_state_snapshot()
-
-    def open_verify_url(self, url):
-        command = None
-        for candidate in (['termux-open-url', url], ['xdg-open', url]):
-            if shutil.which(candidate[0]):
-                command = candidate
-                break
-        if command is None:
-            return {'status': 'manual_required', 'message': '无法自动打开浏览器，请手动访问验证链接', 'verify_url': url}
+def _prompt_accounts():
+    echo('账号来源: 1) 文件  2) 控制台粘贴')
+    source = prompt('选择', default='1')
+    if source.startswith('2'):
+        echo('每行一条：邮箱----密码（实名提交可写 邮箱----密码----姓名----证件号）')
+        echo('粘贴完成后输入空行结束：')
         try:
-            subprocess.Popen(command)
-            return {'status': 'success', 'message': '已尝试在浏览器中打开验证链接', 'command': ' '.join(command)}
-        except Exception as e:
-            return {'status': 'manual_required', 'message': '打开验证链接失败，请手动访问', 'error': str(e), 'verify_url': url}
+            accounts = parse_accounts_text(read_multiline())
+        except ValueError as e:
+            echo(f'解析失败: {e}')
+            return None
+        if not accounts:
+            echo('没有读到任何账号。')
+            return None
+        return accounts
 
-    def _remember(self, result):
-        if result.get('ticket'):
-            self.pending_ticket = result['ticket']
-        if result.get('verify_url'):
-            self.pending_verify_url = result['verify_url']
-        return result
+    path = prompt('文件路径', default='accounts.json')
+    try:
+        return load_accounts(path)
+    except FileNotFoundError:
+        echo(f'文件不存在: {path}')
+    except (ValueError, OSError) as e:
+        echo(f'读取失败: {e}')
+    return None
+
+
+def _resolve_accounts(args):
+    path = getattr(args, 'input', None)
+    if path:
+        try:
+            return load_accounts(path)
+        except FileNotFoundError:
+            echo(f'文件不存在: {path}')
+        except (ValueError, OSError) as e:
+            echo(f'读取失败: {e}')
+        return None
+    if is_interactive():
+        return _prompt_accounts()
+    echo('缺少 --input（文件路径，或 - 表示从标准输入读取）。')
+    return None
+
+
+def _ask_delay(args):
+    delay = getattr(args, 'delay', None)
+    if delay is None:
+        delay = prompt('请求间隔(秒)', default='2')
+    try:
+        return max(0.0, float(delay))
+    except (TypeError, ValueError):
+        return 2.0
 
 
 # --------------------------------------------------------------------------
-# 子命令处理
+# 进度与汇总输出
 # --------------------------------------------------------------------------
 
-def _handle_verify(app, result, args):
-    if result.get('status') != 'need_verify':
+def _cookie_progress(index, total, record):
+    line = f"[{index}/{total}] {record.get('identifier') or record.get('label')} -> {record.get('stage')}"
+    if record.get('nemc_path'):
+        line += f"  {record['nemc_path']}"
+    if record.get('stage') == 'needs_manual_verify':
+        line += f"  需人工验证 ticket={record.get('ticket')}"
+    if record.get('error'):
+        line += f"  error={record['error']}"
+    echo(line)
+
+
+def _realname_progress(index, total, record):
+    state = STATE_LABEL.get(record.get('realname_state'), record.get('realname_state'))
+    line = f"[{index}/{total}] {record.get('identifier') or record.get('label')} -> {state} ({record.get('stage')})"
+    if record.get('submit_status'):
+        line += f" submit={record['submit_status']}"
+    if record.get('stage') == 'needs_manual_verify':
+        line += f"  需人工验证 ticket={record.get('ticket')}"
+    if record.get('error'):
+        line += f"  error={record['error']}"
+    echo(line)
+
+
+def _print_manual(report):
+    manual = report.get('needs_manual_verify') or []
+    if not manual:
         return
     echo()
-    echo('需要完成安全验证：')
-    if result.get('verify_url'):
-        echo(f"  验证链接: {result['verify_url']}")
-    if result.get('ticket'):
-        echo(f"  ticket  : {result['ticket']}")
-    echo(f"  完成后可执行: python main.py verify --ticket {result.get('ticket', '')}")
-    if getattr(args, 'open_url', False) and result.get('verify_url'):
-        print_result(app.open_verify_url(result['verify_url']))
-    if getattr(args, 'wait', False) and result.get('ticket'):
-        echo('开始轮询等待验证完成（Ctrl-C 可中断）...')
-        print_result(app.poll_verify(result['ticket'], args.label or app.pending_phone, timeout=args.timeout))
+    echo('以下账号需要人工完成安全验证，本次已跳过：')
+    for item in manual:
+        echo(f"  - {item.get('identifier')}  ticket={item.get('ticket')}")
+        if item.get('verify_url'):
+            echo(f"    {item['verify_url']}")
+    if report.get('needs_verify_json'):
+        echo(f"已写入: {report['needs_verify_json']}")
 
 
-def cmd_login(app, args):
-    identifier = args.identifier
-    if not identifier:
-        if not is_interactive():
-            echo('缺少 --identifier。')
-            return 2
-        identifier = prompt('邮箱' if args.mode == 'email' else '手机号', required=True)
-
-    if args.mode == 'phone':
-        request = app.request_phone_sms(identifier)
-        print_result(request, verbose=args.verbose)
-        if request.get('status') != 'success':
-            return 1
-        sms_code = args.sms_code
-        if not sms_code:
-            if not is_interactive():
-                echo('缺少 --sms-code。')
-                return 2
-            sms_code = prompt('短信验证码', required=True)
-        result = app.phone_login(identifier, sms_code)
+def _print_summary(report):
+    summary = report.get('summary', {})
+    echo()
+    echo('=== 汇总 ===')
+    if report.get('kind') == 'cookie':
+        echo(f"总计 {summary.get('total')} | 成功 {summary.get('ready')} | "
+             f"待人工验证 {summary.get('needs_manual_verify')} | 失败 {summary.get('failed')}")
     else:
-        password = args.password
-        if not password:
-            if not is_interactive():
-                echo('缺少 --password。')
-                return 2
-            password = prompt_secret('密码', required=True)
-        result = app.email_login(identifier, password)
-
-    print_result(result, verbose=args.verbose)
-    _handle_verify(app, result, args)
-    if result.get('status') == 'success':
-        return 0
-    return 3 if result.get('status') == 'need_verify' else 1
+        echo(f"总计 {summary.get('total')} | 已实名 {summary.get('verified')} | "
+             f"需要实名 {summary.get('required')} | 未知 {summary.get('unknown')}")
+        if report.get('submit_enabled'):
+            echo(f"提交成功 {summary.get('submitted')} | 提交失败 {summary.get('submit_failed')} | "
+                 f"跳过 {summary.get('skipped')}")
+        echo(f"待人工验证 {summary.get('needs_manual_verify')} | 失败 {summary.get('failed')}")
+    _print_manual(report)
+    if report.get('report_json'):
+        echo(f"报告: {report['report_json']}")
+        echo(f"      {report.get('report_csv')}")
 
 
-def cmd_verify(app, args):
-    result = app.confirm_verification(args.ticket, args.label)
-    print_result(result, verbose=args.verbose)
-    return 0 if result.get('status') == 'success' else 1
+# --------------------------------------------------------------------------
+# 子命令
+# --------------------------------------------------------------------------
 
-
-def cmd_send_sms(app, args):
-    result = app.auth.send_verify_sms(args.ticket)
-    print_result(result, verbose=args.verbose)
-    return 0 if result.get('status') == 'success' else 1
-
-
-def cmd_realname_submit(app, args):
-    """先审查实名状态，仅在需要时才收集身份信息并提交。"""
-    review = app.realname_check()
-    print_result(review, verbose=args.verbose)
-    if review.get('status') != 'success':
-        echo('无法确认实名状态，已中止提交。')
+def cmd_cookies(args, runner=None):
+    accounts = _resolve_accounts(args)
+    if not accounts:
+        return 2
+    echo(f'读取到 {len(accounts)} 个账号。')
+    delay = _ask_delay(args)
+    if is_interactive() and not confirm(f'将对 {len(accounts)} 个账号执行「转 Cookie」（间隔 {delay:g}s）？'):
+        echo('已取消。')
         return 1
-
-    state = review.get('realname_state')
-    echo(f"审查结论: {STATE_LABEL.get(state, state)}")
-    if state == REALNAME_VERIFIED:
-        echo('该账号已完成实名，无需提交。')
-        return 0
-    if state != REALNAME_REQUIRED and not args.force:
-        echo('实名状态未知，未自动提交（确认无误可加 --force 强制提交）。')
-        return 1
-
-    realname = args.realname
-    id_num = args.id_num
-    if not realname:
-        if not is_interactive():
-            echo('该账号需要实名，但缺少 --realname。')
-            return 2
-        realname = prompt('实名姓名', required=True)
-    if not id_num:
-        if not is_interactive():
-            echo('该账号需要实名，但缺少 --id-num。')
-            return 2
-        id_num = prompt_secret('证件号', required=True)
-
-    if not args.yes and is_interactive():
-        if not confirm(f"确认提交实名（{mask_realname(realname)} / {mask_id_num(id_num)}）？"):
-            echo('已取消。')
-            return 1
-
-    result = app.realname_submit(realname, id_num, args.id_region)
-    print_result(result, verbose=args.verbose)
-    return 0 if result.get('status') in ('success', 'partial') else 1
-
-
-def cmd_mailbox(app, args):
-    result = app.mailbox()
-    print_result(result, verbose=args.verbose)
-    return 0 if result.get('status') == 'success' else 1
-
-
-def cmd_export(app, args):
-    result = app.export_restored(args.label)
-    print_result(result, verbose=args.verbose)
-    return 0 if result.get('status') == 'success' else 1
-
-
-def cmd_device(app, args):
-    result = app.rebuild_device()
-    print_result(result, verbose=args.verbose)
-    return 0 if result.get('status') == 'success' else 1
-
-
-def cmd_status(app, args):
-    echo(format_status(app.status()))
+    runner = runner or BatchCookieRunner(output_root=getattr(args, 'output', None) or BATCH_OUTPUT_ROOT)
+    report = runner.run(accounts, delay=delay, on_progress=_cookie_progress)
+    _print_summary(report)
     return 0
 
 
-def cmd_batch_realname(app, args):
-    extra = list(getattr(args, 'args', None) or [])
-    if not extra:
-        echo('用法: python main.py batch-realname --input accounts.json [--submit] [--delay 2]')
+def cmd_realname(args, runner=None):
+    accounts = _resolve_accounts(args)
+    if not accounts:
         return 2
-    return batch_realname.main(extra)
+    echo(f'读取到 {len(accounts)} 个账号。')
+
+    submit = getattr(args, 'submit', None)
+    if submit is None:
+        submit = prompt('模式: 1) 只审查  2) 审查后提交', default='1').startswith('2')
+    delay = _ask_delay(args)
+
+    if submit:
+        echo('提示：批量提交只使用每个账号条目自带的真实身份；未提供身份的账号会自动跳过。')
+        if is_interactive() and not confirm('确认对「需要实名」的账号提交实名？'):
+            echo('已取消。')
+            return 1
+    elif is_interactive() and not confirm(f'将对 {len(accounts)} 个账号执行「实名审查」？'):
+        echo('已取消。')
+        return 1
+
+    runner = runner or BatchRealnameRunner(output_root=getattr(args, 'output', None) or BATCH_OUTPUT_ROOT)
+    report = runner.run(accounts, submit=bool(submit), delay=delay, on_progress=_realname_progress)
+    _print_summary(report)
+    return 0
 
 
-COMMANDS = {
-    'login': cmd_login,
-    'verify': cmd_verify,
-    'send-sms': cmd_send_sms,
-    'realname-submit': cmd_realname_submit,
-    'mailbox': cmd_mailbox,
-    'export': cmd_export,
-    'device': cmd_device,
-    'status': cmd_status,
-    'batch-realname': cmd_batch_realname,
-}
+def cmd_result(args):
+    root = getattr(args, 'output', None) or BATCH_OUTPUT_ROOT
+    if not os.path.isdir(root):
+        echo('还没有任何批量运行记录。')
+        return 1
+    runs = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+    if not runs:
+        echo('还没有任何批量运行记录。')
+        return 1
+    run_id = getattr(args, 'run_id', None) or runs[-1]
+    report_path = os.path.join(root, run_id, 'report.json')
+    if not os.path.exists(report_path):
+        echo(f'找不到报告: {report_path}')
+        return 1
+    with open(report_path, encoding='utf-8') as f:
+        report = json.load(f)
+    echo(f"运行: {run_id}  类型: {report.get('kind')}  时间: {report.get('generated_at')}")
+    _print_summary(report)
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -285,48 +230,27 @@ COMMANDS = {
 # --------------------------------------------------------------------------
 
 def build_parser():
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument('-v', '--verbose', action='store_true', help='打印完整原始结果')
-
     parser = argparse.ArgumentParser(
         prog='main.py',
-        description='网易邮箱 / Cookie 工具（纯控制台）',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='网易账号批量工具（转 Cookie / 实名，纯控制台）',
         epilog='不带子命令时进入交互式菜单。',
     )
     sub = parser.add_subparsers(dest='command', metavar='<命令>')
 
-    sp = sub.add_parser('login', parents=[common], help='邮箱/手机号转 Cookie')
-    sp.add_argument('--mode', choices=['email', 'phone'], default='email')
-    sp.add_argument('--identifier', help='邮箱或手机号')
-    sp.add_argument('--password', help='邮箱密码（建议留空改为交互输入）')
-    sp.add_argument('--sms-code', help='手机号模式的短信验证码')
-    sp.add_argument('--label', default='', help='安全验证确认时使用的账号标签')
-    sp.add_argument('--wait', action='store_true', help='触发安全验证时同步轮询等待')
-    sp.add_argument('--open-url', action='store_true', help='触发安全验证时尝试打开验证链接')
-    sp.add_argument('--timeout', type=int, default=300, help='--wait 的轮询超时秒数')
+    sp = sub.add_parser('cookies', help='批量转 Cookie')
+    sp.add_argument('--input', help='账号文件，- 表示从 stdin 读取')
+    sp.add_argument('--delay', type=float, default=2.0, help='账号间隔秒数，默认 2')
+    sp.add_argument('--output', default=BATCH_OUTPUT_ROOT, help='报告输出根目录')
 
-    sp = sub.add_parser('verify', parents=[common], help='提交安全验证 ticket')
-    sp.add_argument('--ticket', required=True)
-    sp.add_argument('--label', default='')
+    sp = sub.add_parser('realname', help='批量实名（默认只审查）')
+    sp.add_argument('--input', help='账号文件，- 表示从 stdin 读取')
+    sp.add_argument('--submit', action='store_true', help='对需要实名的账号提交（默认只审查）')
+    sp.add_argument('--delay', type=float, default=2.0, help='账号间隔秒数，默认 2')
+    sp.add_argument('--output', default=BATCH_OUTPUT_ROOT, help='报告输出根目录')
 
-    sp = sub.add_parser('send-sms', parents=[common], help='为 ticket 发送安全验证短信')
-    sp.add_argument('--ticket', required=True)
-
-    sp = sub.add_parser('realname-submit', parents=[common], help='审查实名状态，需要时再提交（先审查后提交）')
-    sp.add_argument('--realname')
-    sp.add_argument('--id-num')
-    sp.add_argument('--id-region', default='86')
-    sp.add_argument('--yes', action='store_true', help='跳过二次确认')
-    sp.add_argument('--force', action='store_true', help='状态未知时也强制提交')
-
-    sub.add_parser('mailbox', parents=[common], help='获取邮箱消息列表')
-    sp = sub.add_parser('export', parents=[common], help='重新导出已恢复的会话产物')
-    sp.add_argument('--label', default='restored_session')
-    sub.add_parser('device', parents=[common], help='重建本机设备信息')
-    sub.add_parser('status', parents=[common], help='查看当前状态')
-
-    sub.add_parser('batch-realname', help='批量实名认证（用 --input 指定账号文件，其余参数见 batch_realname.py）')
+    sp = sub.add_parser('result', help='查看最近的批量结果')
+    sp.add_argument('--run-id', help='指定运行目录名，默认最近一次')
+    sp.add_argument('--output', default=BATCH_OUTPUT_ROOT, help='报告输出根目录')
 
     return parser
 
@@ -336,78 +260,26 @@ def build_parser():
 # --------------------------------------------------------------------------
 
 MENU = [
-    ('1', '邮箱转 Cookie'),
-    ('2', '手机号转 Cookie'),
-    ('3', '继续安全验证（ticket）'),
-    ('4', '提交实名（先审查，按需提交）'),
-    ('5', '获取邮件列表'),
-    ('6', '导出已恢复会话'),
-    ('7', '重建设备'),
-    ('8', '查看状态'),
-    ('9', '批量实名（说明）'),
+    ('1', '批量转 Cookie'),
+    ('2', '批量实名（默认只审查，可选提交）'),
+    ('3', '查看上次结果'),
     ('0', '退出'),
 ]
 
 
-def _interactive_after_login(app, result):
-    if result.get('status') != 'need_verify':
-        return
-    echo()
-    echo(f"需要安全验证，验证链接: {result.get('verify_url')}")
-    echo(f"ticket: {result.get('ticket')}")
-    if result.get('verify_url') and confirm('是否打开验证链接？', default=False):
-        print_result(app.open_verify_url(result['verify_url']))
-    if result.get('ticket') and confirm('是否轮询等待验证完成？', default=True):
-        print_result(app.poll_verify(result['ticket'], app.pending_phone or 'verified_account'))
-
-
-def _interactive_dispatch(app, choice):
-    if choice == '1':
-        identifier = prompt('邮箱', required=True)
-        password = prompt_secret('密码', required=True)
-        _interactive_after_login(app, app.email_login(identifier, password))
-        echo(format_status(app.status()))
-    elif choice == '2':
-        phone = prompt('手机号', required=True)
-        request = app.request_phone_sms(phone)
-        print_result(request)
-        if request.get('status') == 'success':
-            code = prompt('短信验证码', required=True)
-            _interactive_after_login(app, app.phone_login(phone, code))
-    elif choice == '3':
-        ticket = prompt('ticket', default=app.pending_ticket, required=True)
-        print_result(app.confirm_verification(ticket))
-    elif choice == '4':
-        cmd_realname_submit(app, argparse.Namespace(
-            realname=None, id_num=None, id_region='86', yes=False, force=False, verbose=False))
-    elif choice == '5':
-        print_result(app.mailbox())
-    elif choice == '6':
-        label = prompt('导出标签', default='restored_session')
-        print_result(app.export_restored(label))
-    elif choice == '7':
-        if confirm('确认重建本机设备信息（会重新注册设备）？'):
-            print_result(app.rebuild_device())
-    elif choice == '8':
-        echo(format_status(app.status()))
-    elif choice == '9':
-        echo('批量用法: python main.py batch-realname --input accounts.json [--submit]')
-        echo('默认只审查；确认无误后再加 --submit。')
-    else:
-        echo('无效选择，请重新输入。')
-
-
-def run_interactive(app):
+def run_interactive(_app=None):
     if not is_interactive():
-        echo('当前非交互环境。请使用子命令，例如: python main.py status')
-        echo('查看全部用法: python main.py --help')
+        echo('当前非交互环境。请使用子命令，例如:')
+        echo('  python main.py realname --input accounts.txt')
+        echo('查看用法: python main.py --help')
         return 2
-    echo('网易邮箱 / Cookie 控制台')
+
+    echo('网易账号批量工具')
     while True:
         echo()
         echo('=== 主菜单 ===')
         for key, label in MENU:
-            echo(f'  {key:>2}) {label}')
+            echo(f'  {key}) {label}')
         try:
             choice = input('请选择: ').strip()
         except EOFError:
@@ -416,37 +288,31 @@ def run_interactive(app):
         if choice in ('0', 'q', 'quit', 'exit'):
             echo('再见。')
             return 0
-        try:
-            _interactive_dispatch(app, choice)
-        except KeyboardInterrupt:
-            echo()
-            echo('已取消当前操作。')
+        if choice == '1':
+            cmd_cookies(argparse.Namespace(input=None, delay=None, output=BATCH_OUTPUT_ROOT))
+        elif choice == '2':
+            cmd_realname(argparse.Namespace(input=None, submit=None, delay=None, output=BATCH_OUTPUT_ROOT))
+        elif choice == '3':
+            cmd_result(argparse.Namespace(run_id=None, output=BATCH_OUTPUT_ROOT))
+        else:
+            echo('无效选择，请重新输入。')
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-
-    # batch-realname 的参数直接透传给 batch_realname.py，避免 argparse 的 REMAINDER 陷阱。
-    if argv and argv[0] == 'batch-realname':
-        rest = argv[1:]
-        if not rest:
-            echo('用法: python main.py batch-realname --input accounts.json [--submit] [--delay 2]')
-            return 2
-        return batch_realname.main(rest)
-
     parser = build_parser()
     args = parser.parse_args(argv)
-    app = ConsoleApp()
 
     if not args.command:
-        return run_interactive(app)
+        return run_interactive()
 
-    handler = COMMANDS.get(args.command)
+    handlers = {'cookies': cmd_cookies, 'realname': cmd_realname, 'result': cmd_result}
+    handler = handlers.get(args.command)
     if handler is None:
         parser.print_help()
         return 2
     try:
-        return handler(app, args) or 0
+        return handler(args) or 0
     except KeyboardInterrupt:
         echo()
         echo('已中断。')

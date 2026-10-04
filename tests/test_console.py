@@ -1,210 +1,142 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""纯控制台入口的离线测试（全部使用桩对象，不联网）。"""
+"""批量控制台入口的离线测试（注入桩 runner，不联网）。"""
 
 import io
+import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main as console
-from console_ui import format_status, summarize_result
 
 
-class FakeAuth:
-    def __init__(self, realname_state='required'):
-        self.realname_state = realname_state
-        self.last_login_context = {}
+class FakeRunner:
+    def __init__(self, kind='cookie', summary=None):
+        self.kind = kind
         self.calls = []
-        self._snapshot = {
-            'device_id': 'dev1', 'device_key_present': True, 'sdkuid': 'uid',
-            'sessionid_present': True, 'cookie_count': 3, 'restored_session': {'has_sauth': True},
-            'current_conversion_complete': True, 'current_conversion_label': 'a@163.com',
+        self.summary = summary or {'total': 1, 'ready': 1, 'needs_manual_verify': 0, 'failed': 0}
+
+    def run(self, accounts, delay=0.0, on_progress=None, submit=False):
+        self.calls.append({'accounts': accounts, 'delay': delay, 'submit': submit})
+        if on_progress:
+            on_progress(1, len(accounts), {
+                'index': 1, 'identifier': accounts[0].get('identifier', 'a'), 'label': 'a',
+                'stage': 'cookie_ready', 'nemc_path': '/tmp/x.json',
+            })
+        return {
+            'kind': self.kind, 'summary': self.summary, 'results': [],
+            'report_json': 'r.json', 'report_csv': 'r.csv',
         }
 
-    def check_realname_status(self):
-        return {'status': 'success', 'message': '实名状态查询成功', 'realname_state': self.realname_state,
-                'needs_realname': self.realname_state == 'required', 'realname_status': 0, 'need_aas': True}
 
-    def submit_realname(self, realname, id_num, id_region='86'):
-        self.calls.append(('submit', realname, id_num, id_region))
-        return {'status': 'success', 'message': '实名提交成功', 'need_aas': False, 'realname_type': '成年人'}
-
-    def check_verification_status(self, ticket):
-        return {'status': 'pending', 'verify_state': 'verify_pending'}
-
-    def send_verify_sms(self, ticket):
-        return {'status': 'success', 'message': '短信验证码已发送'}
-
-    def export_restored_session(self, label):
-        return {'status': 'success', 'message': '已导出', 'export_paths': ['artifacts/x.json']}
-
-    def rebuild_device(self):
-        return {'status': 'success', 'message': '设备信息上传成功'}
-
-    def get_state_snapshot(self):
-        return self._snapshot
-
-
-class FakeWorkflow:
-    def __init__(self, login_result):
-        self.login_result = login_result
-        self.calls = []
-
-    def run_email_login(self, identifier, password):
-        self.calls.append(('email', identifier, password))
-        return self.login_result
-
-    def request_phone_sms(self, phone):
-        self.calls.append(('request_sms', phone))
-        return {'status': 'success', 'message': '短信验证码已请求'}
-
-    def complete_phone_login(self, phone, code):
-        self.calls.append(('phone', phone, code))
-        return self.login_result
-
-    def confirm_verification(self, ticket, label):
-        self.calls.append(('verify', ticket, label))
-        return {'status': 'success', 'message': '验证确认成功'}
-
-    def fetch_mailbox(self):
-        return {'status': 'success', 'message': '邮箱列表获取成功'}
-
-
-def make_app(login_result=None, realname_state='required'):
-    login_result = login_result or {'status': 'success', 'message': '登录成功', 'artifacts': {}}
-    return console.ConsoleApp(auth=FakeAuth(realname_state), workflow=FakeWorkflow(login_result))
-
-
-def run(capture_output, func, *args, **kwargs):
-    with redirect_stdout(capture_output):
+def run(capture, func, *args, **kwargs):
+    with redirect_stdout(capture):
         return func(*args, **kwargs)
 
 
+def write_accounts(base, text='a@163.com----pw\nb@163.com----pw2\n'):
+    path = os.path.join(base, 'accounts.txt')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    return path
+
+
 class ParserTest(unittest.TestCase):
-    def test_login_defaults(self):
-        args = console.build_parser().parse_args(['login', '--identifier', 'a@163.com'])
-        self.assertEqual(args.command, 'login')
-        self.assertEqual(args.mode, 'email')
-        self.assertEqual(args.timeout, 300)
+    def test_cookies_defaults(self):
+        args = console.build_parser().parse_args(['cookies', '--input', 'x.txt'])
+        self.assertEqual(args.command, 'cookies')
+        self.assertEqual(args.delay, 2.0)
+        self.assertEqual(args.output, console.BATCH_OUTPUT_ROOT)
 
-    def test_short_verbose_flag(self):
-        args = console.build_parser().parse_args(['status', '-v'])
-        self.assertTrue(args.verbose)
+    def test_realname_submit_flag(self):
+        args = console.build_parser().parse_args(['realname', '--input', 'x.txt', '--submit'])
+        self.assertTrue(args.submit)
 
-    def test_batch_realname_intercepted_without_args(self):
-        # batch-realname 由 main() 拦截并透传；不带参数时给出用法
-        out = io.StringIO()
-        code = run(out, console.main, ['batch-realname'])
-        self.assertEqual(code, 2)
-        self.assertIn('accounts.json', out.getvalue())
+    def test_realname_defaults_to_review(self):
+        args = console.build_parser().parse_args(['realname', '--input', 'x.txt'])
+        self.assertFalse(args.submit)
 
 
-class LoginCommandTest(unittest.TestCase):
-    def test_email_login_success(self):
-        app = make_app()
-        args = console.build_parser().parse_args(['login', '--identifier', 'a@163.com', '--password', 'pw'])
-        code = run(io.StringIO(), console.cmd_login, app, args)
-        self.assertEqual(code, 0)
-        self.assertEqual(app.workflow.calls, [('email', 'a@163.com', 'pw')])
+class CookiesCommandTest(unittest.TestCase):
+    def test_reads_file_and_runs(self):
+        with tempfile.TemporaryDirectory() as base:
+            path = write_accounts(base)
+            runner = FakeRunner()
+            args = console.build_parser().parse_args(['cookies', '--input', path, '--delay', '0'])
+            out = io.StringIO()
+            code = run(out, console.cmd_cookies, args, runner)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(runner.calls), 1)
+            self.assertEqual(len(runner.calls[0]['accounts']), 2)
+            self.assertIn('汇总', out.getvalue())
 
-    def test_need_verify_sets_pending_and_returns_3(self):
-        app = make_app({'status': 'need_verify', 'message': '需要完成安全验证', 'ticket': 'TK', 'verify_url': 'https://v/?ticket=TK'})
-        args = console.build_parser().parse_args(['login', '--identifier', 'a@163.com', '--password', 'pw'])
-        out = io.StringIO()
-        code = run(out, console.cmd_login, app, args)
-        self.assertEqual(code, 3)
-        self.assertEqual(app.pending_ticket, 'TK')
-        self.assertIn('验证链接', out.getvalue())
-        self.assertIn('TK', out.getvalue())
-
-    def test_missing_identifier_non_interactive(self):
-        app = make_app()
-        args = console.build_parser().parse_args(['login'])
-        code = run(io.StringIO(), console.cmd_login, app, args)
-        self.assertEqual(code, 2)
+    def test_missing_input_non_interactive(self):
+        with mock.patch.object(console, 'is_interactive', return_value=False):
+            args = console.build_parser().parse_args(['cookies'])
+            code = run(io.StringIO(), console.cmd_cookies, args, FakeRunner())
+            self.assertEqual(code, 2)
 
 
 class RealnameCommandTest(unittest.TestCase):
-    def test_submit_reviews_then_submits_when_required(self):
-        app = make_app()
-        args = console.build_parser().parse_args(
-            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes'])
-        out = io.StringIO()
-        code = run(out, console.cmd_realname_submit, app, args)
-        self.assertEqual(code, 0)
-        self.assertIn('审查结论: 需要实名', out.getvalue())
-        self.assertEqual(app.auth.calls, [('submit', '张三', '110101199001011237', '86')])
+    def test_review_only(self):
+        with tempfile.TemporaryDirectory() as base:
+            path = write_accounts(base)
+            runner = FakeRunner('realname', summary={'total': 2, 'verified': 1, 'required': 1,
+                                                     'unknown': 0, 'needs_manual_verify': 0, 'failed': 0})
+            args = console.build_parser().parse_args(['realname', '--input', path, '--delay', '0'])
+            code = run(io.StringIO(), console.cmd_realname, args, runner)
+            self.assertEqual(code, 0)
+            self.assertFalse(runner.calls[0]['submit'])
 
-    def test_submit_skips_when_already_verified(self):
-        app = make_app(realname_state='verified')
-        args = console.build_parser().parse_args(['realname-submit', '--yes'])
-        out = io.StringIO()
-        code = run(out, console.cmd_realname_submit, app, args)
-        self.assertEqual(code, 0)
-        self.assertIn('无需提交', out.getvalue())
-        self.assertEqual(app.auth.calls, [])
-
-    def test_submit_blocks_on_unknown_without_force(self):
-        app = make_app(realname_state='unknown')
-        args = console.build_parser().parse_args(
-            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes'])
-        out = io.StringIO()
-        code = run(out, console.cmd_realname_submit, app, args)
-        self.assertEqual(code, 1)
-        self.assertIn('状态未知', out.getvalue())
-        self.assertEqual(app.auth.calls, [])
-
-    def test_submit_force_overrides_unknown(self):
-        app = make_app(realname_state='unknown')
-        args = console.build_parser().parse_args(
-            ['realname-submit', '--realname', '张三', '--id-num', '110101199001011237', '--yes', '--force'])
-        code = run(io.StringIO(), console.cmd_realname_submit, app, args)
-        self.assertEqual(code, 0)
-        self.assertEqual(len(app.auth.calls), 1)
-
-    def test_submit_requires_identity_after_review(self):
-        app = make_app()
-        args = console.build_parser().parse_args(['realname-submit', '--id-num', 'x', '--yes'])
-        code = run(io.StringIO(), console.cmd_realname_submit, app, args)
-        self.assertEqual(code, 2)
-        self.assertEqual(app.auth.calls, [])
+    def test_submit_mode(self):
+        with tempfile.TemporaryDirectory() as base:
+            path = write_accounts(base)
+            runner = FakeRunner('realname', summary={'total': 2, 'verified': 0, 'required': 2,
+                                                     'unknown': 0, 'submitted': 2, 'submit_failed': 0,
+                                                     'skipped': 0, 'needs_manual_verify': 0, 'failed': 0})
+            args = console.build_parser().parse_args(['realname', '--input', path, '--delay', '0', '--submit'])
+            code = run(io.StringIO(), console.cmd_realname, args, runner)
+            self.assertEqual(code, 0)
+            self.assertTrue(runner.calls[0]['submit'])
 
 
-class MiscCommandTest(unittest.TestCase):
-    def test_batch_without_args(self):
-        app = make_app()
-        args = console.build_parser().parse_args(['batch-realname'])
-        code = run(io.StringIO(), console.cmd_batch_realname, app, args)
-        self.assertEqual(code, 2)
+class ResultCommandTest(unittest.TestCase):
+    def test_prints_latest_report(self):
+        with tempfile.TemporaryDirectory() as base:
+            run_dir = os.path.join(base, '20260101_000000')
+            os.makedirs(run_dir)
+            report = {'kind': 'cookie', 'generated_at': '2026-01-01 00:00:00',
+                      'summary': {'total': 1, 'ready': 1, 'needs_manual_verify': 0, 'failed': 0},
+                      'results': [], 'needs_manual_verify': []}
+            with open(os.path.join(run_dir, 'report.json'), 'w', encoding='utf-8') as f:
+                json.dump(report, f)
+            args = console.build_parser().parse_args(['result', '--output', base])
+            out = io.StringIO()
+            code = run(out, console.cmd_result, args)
+            self.assertEqual(code, 0)
+            self.assertIn('20260101_000000', out.getvalue())
 
-    def test_export_and_status(self):
-        app = make_app()
-        args = console.build_parser().parse_args(['export'])
-        self.assertEqual(run(io.StringIO(), console.cmd_export, app, args), 0)
-        args = console.build_parser().parse_args(['status'])
-        out = io.StringIO()
-        self.assertEqual(run(out, console.cmd_status, app, args), 0)
-        self.assertIn('设备ID: dev1', out.getvalue())
+    def test_no_runs(self):
+        with tempfile.TemporaryDirectory() as base:
+            args = console.build_parser().parse_args(['result', '--output', base])
+            code = run(io.StringIO(), console.cmd_result, args)
+            self.assertEqual(code, 1)
 
 
-class ConsoleUiTest(unittest.TestCase):
-    def test_summarize_result_marks_verify_link(self):
-        lines = summarize_result({'status': 'need_verify', 'message': '需要完成安全验证',
-                                  'verify_url': 'https://v/?ticket=TK', 'ticket': 'TK',
-                                  'verify_state': 'verify_required'})
-        blob = '\n'.join(lines)
-        self.assertIn('验证链接', blob)
-        self.assertIn('Ticket: TK', blob)
-
-    def test_format_status(self):
-        text = format_status(FakeAuth().get_state_snapshot())
-        self.assertIn('会话(sessionid): 有效', text)
-        self.assertIn('HTTP Cookies: 3 个', text)
+class InteractiveGuardTest(unittest.TestCase):
+    def test_non_interactive_prints_hint(self):
+        with mock.patch.object(console, 'is_interactive', return_value=False):
+            out = io.StringIO()
+            code = run(out, console.run_interactive)
+            self.assertEqual(code, 2)
+            self.assertIn('非交互环境', out.getvalue())
 
 
 if __name__ == '__main__':
