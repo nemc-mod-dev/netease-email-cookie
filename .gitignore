@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+artifacts/
+cookies.json
+device_info.json
+sauth_data.json
+nemc_cookie_*.json
